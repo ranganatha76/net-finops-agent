@@ -1,0 +1,190 @@
+# Net FinOps Agent — runtime configuration
+#
+# Loaded by:  internal/config.Load()  via CLI flag  --config
+# Consumed by: engine, policy evaluator, provider scanners, remediator
+#
+# Pass explicitly:
+#   ./bin/net-finops-agent scan --config configs/config.yaml --mode demo
+#
+# If the file is missing, the CLI falls back to built-in Defaults().
+
+# =============================================================================
+# scan — utilization lookback window
+# =============================================================================
+# USED BY:
+#   - Every provider Scanner (AWS/Azure/GCP/K8s) when fetching metrics
+#   - policy.Evaluator copies lookback_hours onto each Finding
+#   - ScanReport.LookbackHours (shown in reports)
+scan:
+  # Hours of history for averages (CPU, bytes/h, RPS, invocations, …).
+  # 168 = 7 days. Shorter = more reactive; longer = smoother idle detection.
+  lookback_hours: 168
+
+# =============================================================================
+# policy — idle thresholds + protection rules
+# =============================================================================
+# USED BY: internal/policy.Evaluator (after each provider Scan)
+# Flow: Finding → protect? → classify → compare metric to thresholds → action
+policy:
+  # --- Class: traffic_bytes (NAT, IGW, SGW, firewall, private endpoint, …) ---
+  # Metric unit typically: bytes/hour
+  #   metric ≤ gateway_idle_bytes_per_hour  → ActionShutdown (critical)
+  #   metric ≤ gateway_low_bytes_per_hour   → ActionDownsize (high)
+  #   else                                  → ActionNone
+  gateway_idle_bytes_per_hour: 1048576    # 1 MiB/h
+  gateway_low_bytes_per_hour: 10485760    # 10 MiB/h
+
+  # --- Class: request_rate (LB, Ingress, Gateway API, API gateway, queues, …) ---
+  # Also reused for function invocation-style metrics in compute_idle.
+  #   metric ≤ gateway_idle_rps → ActionShutdown
+  gateway_idle_rps: 0.01
+
+  # --- Class: attachment (DRG, TGW, VPN gateway, ExpressRoute GW, …) ---
+  # Metric unit typically: attachments
+  #   metric == 0                              → ActionShutdown
+  #   0 < metric < min_gateway_attachments     → ActionDownsize (consolidate)
+  #   else                                     → ActionNone
+  min_gateway_attachments: 2
+
+  # --- Class: compute_idle (instance/VM, database, function, pod, …) ---
+  # Metric unit typically: cpu_percent (or invocations_per_hour / rps)
+  #   metric ≤ compute_idle_percent → ActionShutdown
+  #   metric ≤ compute_low_percent  → ActionDownsize
+  compute_idle_percent: 5
+  compute_low_percent: 20
+
+  # --- Class: storage_idle (disk, snapshot, bucket, PVC, …) ---
+  # If unit is attached/bool/in_use: metric ≤ 0 → ActionShutdown
+  # If unit is percent: metric ≤ storage_idle_percent → ActionShutdown
+  storage_idle_percent: 5
+
+  # --- Class: replica_waste (Deployment, StatefulSet, DaemonSet, Namespace, …) ---
+  # If unit is rps: same as gateway_idle_rps
+  # If unit is replicas:
+  #   metric < min_active_replicas → ActionShutdown (idle / zero ready)
+  #   metric > max_idle_replicas   → ActionDownsize (over-provisioned)
+  min_active_replicas: 1
+  max_idle_replicas: 3
+
+  # --- Class: utilization (unknown / custom kinds) ---
+  #   metric ≤ generic_idle_threshold → ActionShutdown
+  generic_idle_threshold: 0.01
+
+  # --- Protection (checked BEFORE thresholds; sets Protected=true, ActionNotify) ---
+  # USED BY: policy.protectionReason()
+  #
+  # Skip resources younger than this (avoids racing new lab spin-ups).
+  min_age_hours: 24
+
+  # If a finding has tag KEY with value matching (case-insensitive), protect it.
+  # Example: tags.environment=production → never shut down.
+  exclude_tags:
+    finops: "keep"              # tag finops=keep → protect
+    environment: "production"   # tag environment=production → protect
+
+  # Kubernetes: findings in these namespaces are never mutated.
+  protected_namespaces:
+    - kube-system
+    - kube-public
+    - ingress-nginx
+
+# =============================================================================
+# cost — hourly USD rates for monthly waste estimates
+# =============================================================================
+# USED BY: config.HourlyRate(cloud, kind) → policy.monthlyFromRate()
+# Formula: MonthlyWasteUSD ≈ HourlyRate × 730
+# Lookup order:
+#   1) cost.by_cloud[<cloud>][<kind>]
+#   2) cost.defaults[<kind>]
+#   3) built-in catalog from Defaults() (merged when defaults is empty/partial)
+#   4) fallback 0.01 USD/hour
+#
+# Kind keys are normalized (e.g. igw→internet_gateway, ec2→instance).
+cost:
+  # Empty map = use full built-in catalog from code Defaults().
+  # Override only what you need, e.g.:
+  #   defaults:
+  #     nat_gateway: 0.048
+  #     instance: 0.06
+  defaults: {}
+
+  # Per-cloud overrides (win over defaults for that cloud id).
+  by_cloud:
+    kubernetes:
+      deployment: 0.02
+      statefulset: 0.03
+      persistentvolumeclaim: 0.01
+
+# =============================================================================
+# providers — which CSPs/platforms to scan
+# =============================================================================
+# USED BY:
+#   - config.EnabledProviders() → registry.BuildEnabled()
+#   - Each Scanner reads providers.<id>.regions and .account
+#   - Generic/inventory CSPs read providers.<id>.options.inventory_file
+#
+# Only ids with a registered factory work (aws, azure, gcp, oci, kubernetes,
+# alibaba, digitalocean, ibm, generic, …). enabled:false skips the CSP.
+providers:
+  aws:
+    enabled: true                 # include in Scan / Remediate
+    account: demo-aws             # stamped on Finding.AccountOrSub
+    regions: [ap-south-1, us-east-1]  # Scanner iterates these regions
+
+  azure:
+    enabled: true
+    account: demo-azure
+    regions: [centralindia]       # Azure locations
+
+  gcp:
+    enabled: true
+    account: demo-gcp             # GCP project id (demo)
+    regions: [asia-south1]
+
+  oci:
+    enabled: true
+    account: demo-oci
+    regions: [ap-mumbai-1]
+    # For live/custom inventory instead of built-in demo snapshot:
+    # options:
+    #   inventory_file: configs/inventory.example.yaml
+
+  kubernetes:
+    enabled: true
+    account: blr-dev-cluster      # cluster name on findings (Region/AccountOrSub)
+    # regions: [blr-dev-cluster]  # optional; account is preferred for cluster name
+    # options:
+    #   kubeconfig: /path/to/kubeconfig   # reserved for future live client-go wiring
+
+  # Example: any inventory-backed CSP (no native SDK required)
+  # digitalocean:
+  #   enabled: true
+  #   account: "12345678"
+  #   options:
+  #     inventory_file: configs/inventory.example.yaml
+
+# =============================================================================
+# remediator — mutation safety (CLI remediate + service cycles)
+# =============================================================================
+remediator:
+  dry_run: true
+  max_actions_per_run: 100
+  require_approval_tag: false
+
+# =============================================================================
+# service — HTTP microservice + Prometheus metrics (Grafana)
+# =============================================================================
+# USED BY: `net-finops-agent serve`
+# Endpoints:
+#   GET  /healthz /readyz /metrics
+#   GET  /api/v1/report
+#   GET  /api/v1/tenants/savings   ← per-tenant monthly waste estimate
+#   POST /api/v1/scan
+#   POST /api/v1/remediate?dry_run=true|false
+#
+# Prometheus scrapes /metrics. Import deploy/grafana/dashboard.json into Grafana.
+service:
+  listen_addr: ":8080"
+  schedule_interval: "15m"   # Go duration: 1m, 15m, 1h, …
+  auto_remediate: false      # true = remediate after each scheduled scan
+  dry_run: true              # scheduled/API remediate default (API can override)

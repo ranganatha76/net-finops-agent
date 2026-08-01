@@ -1,0 +1,100 @@
+# Normalized inventory — feed ANY cloud/K8s estate without a native SDK adapter.
+#
+# HOW IT IS USED
+# --------------
+# 1. Point a provider at this file:
+#      providers:
+#        digitalocean:          # or oci / alibaba / ibm / generic / custom id*
+#          enabled: true
+#          options:
+#            inventory_file: configs/inventory.example.yaml
+#
+#    * custom ids need registry.Register + factoryGeneric, or use "generic".
+#
+# 2. generic.Scanner reads the YAML → builds finops.Finding per item
+# 3. policy.Evaluator classifies using kind + metric_unit (+ optional policy_class)
+# 4. Same engine path as AWS/Azure/GCP/K8s native scanners
+#
+# Field → Finding mapping
+# -----------------------
+# cloud          → Finding.Cloud
+# account        → Finding.AccountOrSub
+# kind           → Finding.Kind   (free-form; aliases like igw/drg/ec2 normalized)
+# name           → Finding.Name
+# resource_id    → Finding.ResourceID
+# region         → Finding.Region
+# namespace       → Finding.Namespace (K8s protection uses this)
+# tags           → Finding.Tags (exclude_tags / finops-approve checked here)
+# created_at     → Finding.CreatedAt (min_age_hours protection)
+# metric_*       → Finding.MetricName / MetricValue / MetricUnit
+# policy_class   → Finding.PolicyClass (optional override of auto-classify)
+#
+# policy_class values (optional):
+#   traffic_bytes | association | request_rate | attachment |
+#   compute_idle  | storage_idle | replica_waste | utilization
+
+cloud: aws
+account: "123456789012"
+
+items:
+  # --- compute_idle (cpu_percent ≤ policy.compute_idle_percent → shutdown) ---
+  - kind: instance
+    name: idle-dev-vm
+    resource_id: i-abc
+    region: ap-south-1
+    created_at: 2026-06-01T00:00:00Z
+    tags:
+      environment: development
+    metric_name: CPUUtilization
+    metric_value: 1.5
+    metric_unit: cpu_percent
+
+  # --- storage_idle (attached/in_use == 0 → shutdown) ---
+  - kind: disk
+    name: orphan-vol
+    resource_id: vol-xyz
+    region: ap-south-1
+    created_at: 2026-05-01T00:00:00Z
+    tags:
+      environment: development
+    metric_name: attached
+    metric_value: 0
+    metric_unit: attached
+    policy_class: storage_idle   # force class even if unit were ambiguous
+
+  # --- replica_waste (replicas < min_active_replicas → shutdown) ---
+  - kind: deployment
+    name: abandoned-api
+    resource_id: abandoned-api
+    region: blr-dev
+    namespace: scratch
+    created_at: 2026-06-01T00:00:00Z
+    tags:
+      environment: development
+    metric_name: ready_replicas
+    metric_value: 0
+    metric_unit: replicas
+
+  # --- utilization (custom kind; metric ≤ generic_idle_threshold → shutdown) ---
+  - kind: my_vendor_appliance
+    name: leftover-box
+    resource_id: appliance-1
+    region: ap-south-1
+    created_at: 2026-04-01T00:00:00Z
+    tags:
+      environment: development
+    metric_name: busy
+    metric_value: 0
+    metric_unit: utilization
+
+  # --- Example: production tag → PROTECTED (never remediated) ---
+  # - kind: nat_gateway
+  #   name: prod-nat
+  #   resource_id: nat-prod
+  #   region: ap-south-1
+  #   created_at: 2025-01-01T00:00:00Z
+  #   tags:
+  #     environment: production    # matches policy.exclude_tags
+  #   metric_name: bytes_out
+  #   metric_value: 0
+  #   metric_unit: bytes/hour
